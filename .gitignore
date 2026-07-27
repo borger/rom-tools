@@ -18,3 +18,7 @@ boot9.bin
 /work/
 *.part
 .DS_Store
+
+# Local agent/contributor guidance — keep out of the public repo.
+AGENTS.md
+CLAUDE.md
