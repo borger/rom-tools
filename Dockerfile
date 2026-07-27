@@ -17,7 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates curl unzip xz-utils \
       autoconf automake libtool pkg-config \
-      liblz4-dev zlib1g-dev libssl-dev \
+      liblz4-dev zlib1g-dev libssl-dev libuv1-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /out/bin
 WORKDIR /build
@@ -82,7 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       p7zip-full unzip zip unar xorriso genisoimage \
       python3 python3-pip \
       rsync curl wget ca-certificates xxd file coreutils git jq sqlite3 \
-      liblz4-1 zlib1g libicu74 libssl3 \
+      liblz4-1 zlib1g libicu74 libssl3 libuv1 \
  && rm -rf /var/lib/apt/lists/*
 # Switch NSZ/XCZ (de)compression (Python, PEP668 override on 24.04)
 RUN pip3 install --no-cache-dir --break-system-packages nsz
