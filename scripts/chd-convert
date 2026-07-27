@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Convert disc images to CHD, and build .m3u playlists for multi-disc sets.
+#
+#   chd-convert <src_dir> <out_dir>
+#
+# Converts every .cue and .gdi in src_dir via `chdman createcd`. Any set whose
+# members are named "... (Disc N) ..." also gets a .m3u listing its discs, so
+# multi-disc games load as one entry. A failed conversion deletes its partial
+# .chd rather than leaving it behind.
+set -uo pipefail
+
+SRC="${1:?usage: chd-convert <src_dir> <out_dir>}"
+OUT="${2:?usage: chd-convert <src_dir> <out_dir>}"
+mkdir -p "$OUT"
+shopt -s nullglob nocaseglob
+
+ok=0; fail=0
+for img in "$SRC"/*.cue "$SRC"/*.gdi; do
+  base="$(basename "$img")"; base="${base%.*}"
+  chd="$OUT/$base.chd"
+  echo "### $base"
+  if chdman createcd -i "$img" -o "$chd" >/dev/null 2>&1; then
+    echo "  OK -> $base.chd"; ok=$((ok+1))
+  else
+    echo "  FAIL"; rm -f "$chd"; fail=$((fail+1))
+  fi
+done
+
+# Build .m3u for any multi-disc sets present in the output.
+declare -A sets
+for chd in "$OUT"/*.chd; do
+  b="$(basename "$chd")"
+  if echo "$b" | grep -qiE '\(disc [0-9]+\)'; then
+    key="$(echo "$b" | sed -E 's/ *\(disc [0-9]+\).*//I')"
+    sets["$key"]=1
+  fi
+done
+for key in "${!sets[@]}"; do
+  m3u="$OUT/$key.m3u"; : > "$m3u"
+  for chd in "$OUT/$key"*"(Disc "*.chd; do
+    [ -e "$chd" ] && basename "$chd" >> "$m3u"
+  done
+  echo "m3u: $(basename "$m3u") ($(wc -l < "$m3u") discs)"
+done
+echo "done: ok=$ok fail=$fail"

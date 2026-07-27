@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Decrypt Redump PS3 disc images using their disc keys, verifying each result.
+#
+#   ps3-decrypt <src_dir> <dkey_dir> <out_dir>
+#
+# src_dir   : Redump .zip archives and/or raw encrypted .iso files
+# dkey_dir  : matching disc keys as .zip (Redump layout) or raw .dkey files
+# out_dir   : decrypted .iso files land here (only if they verify)
+#
+# Key lookup tolerates version tags (drops a trailing " (vNN.NN)") and falls
+# back to a fuzzy title+region prefix match. Each output is verified by
+# extracting EBOOT.BIN and checking for the SCE magic (53434500); a bad decrypt
+# is deleted rather than kept. Truncated/corrupt source archives are skipped.
+set -uo pipefail
+
+SRC="${1:?usage: ps3-decrypt <src_dir> <dkey_dir> <out_dir>}"
+DK="${2:?usage: ps3-decrypt <src_dir> <dkey_dir> <out_dir>}"
+OUT="${3:?usage: ps3-decrypt <src_dir> <dkey_dir> <out_dir>}"
+mkdir -p "$OUT"
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+resolve_dkey() {
+  local b="$1"
+  [ -f "$DK/$b.zip" ]  && { echo "$DK/$b.zip";  return; }
+  [ -f "$DK/$b.dkey" ] && { echo "$DK/$b.dkey"; return; }
+  local nov; nov="$(echo "$b" | sed -E 's/ \(v[0-9.]+\)$//')"
+  [ -f "$DK/$nov.zip" ]  && { echo "$DK/$nov.zip";  return; }
+  [ -f "$DK/$nov.dkey" ] && { echo "$DK/$nov.dkey"; return; }
+  local pref; pref="$(echo "$nov" | sed -E 's/^(.*\((USA|Europe|Japan|Asia|Korea)).*/\1/')"
+  ls "$DK/"*.zip 2>/dev/null | grep -iF "$pref" | head -1
+}
+
+decode_key() {
+  local f="$1"
+  case "$f" in
+    *.zip) rm -rf "$WORK/dk"; mkdir -p "$WORK/dk"
+           7z x -y -o"$WORK/dk" "$f" >/dev/null 2>&1
+           f="$(find "$WORK/dk" -type f | head -1)" ;;
+  esac
+  xxd -p "$f" | tr -d '\n'
+}
+
+shopt -s nullglob
+ok=0; fail=0
+for src in "$SRC"/*.zip "$SRC"/*.iso; do
+  base="$(basename "$src")"; base="${base%.*}"
+  echo "### $base"
+
+  ENC=""
+  case "$src" in
+    *.zip)
+      if ! 7z l "$src" >/dev/null 2>&1; then
+        echo "  TRUNCATED/CORRUPT zip — skip"; fail=$((fail+1)); continue
+      fi
+      rm -rf "$WORK/iso"; mkdir -p "$WORK/iso"
+      if ! 7z x -y -o"$WORK/iso" "$src" >/dev/null 2>&1; then
+        echo "  extract failed (corrupt payload?) — skip"; fail=$((fail+1)); continue
+      fi
+      ENC="$(find "$WORK/iso" -iname '*.iso' | head -1)" ;;
+    *.iso) ENC="$src" ;;
+  esac
+  [ -n "$ENC" ] || { echo "  no .iso found"; fail=$((fail+1)); continue; }
+
+  DKF="$(resolve_dkey "$base")"
+  [ -n "$DKF" ] || { echo "  no matching disc key"; fail=$((fail+1)); continue; }
+  KEY="$(decode_key "$DKF")"
+  [ "${#KEY}" -eq 32 ] || { echo "  bad key length (${#KEY})"; fail=$((fail+1)); continue; }
+
+  DEC="$OUT/$base.iso"
+  if ! PS3Dec d key "$KEY" "$ENC" "$DEC" >/dev/null 2>&1; then
+    echo "  decrypt failed"; rm -f "$DEC"; fail=$((fail+1)); continue
+  fi
+
+  rm -rf "$WORK/vf"; mkdir -p "$WORK/vf"
+  7z e -o"$WORK/vf" "$DEC" "PS3_GAME/USRDIR/EBOOT.BIN" >/dev/null 2>&1 \
+    || 7z e -o"$WORK/vf" "$DEC" -r EBOOT.BIN >/dev/null 2>&1
+  EB="$(find "$WORK/vf" -iname EBOOT.BIN | head -1)"
+  MAGIC="$(head -c4 "$EB" 2>/dev/null | xxd -p)"
+  if [ "$MAGIC" = "53434500" ]; then
+    echo "  OK (SCE verified) -> $base.iso"; ok=$((ok+1))
+  else
+    echo "  FAIL: EBOOT magic '$MAGIC' != SCE — removing bad output"
+    rm -f "$DEC"; fail=$((fail+1))
+  fi
+  rm -rf "$WORK/iso" "$WORK/vf"
+done
+echo "done: ok=$ok fail=$fail"

@@ -1,0 +1,20 @@
+# Never commit keys, ROMs, or build junk to this public repo.
+*.keys
+prod.keys
+*.bin
+*.dkey
+boot9.bin
+*.iso
+*.chd
+*.pkg
+*.nsp
+*.nsz
+*.xci
+*.cia
+*.3ds
+*.nds
+
+# local scratch
+/work/
+*.part
+.DS_Store

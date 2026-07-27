@@ -1,0 +1,32 @@
+# Example ROM-processing worker pod — copy this into your own (private) infra
+# repo and fill in the placeholders. Nothing here is environment-specific.
+#
+#   kubectl apply -f rom-worker.yaml
+#   kubectl exec -it -n <namespace> rom-worker -- bash
+#   kubectl exec -n <namespace> rom-worker -- rom-tools    # list the toolchain
+#
+# The image is public on GHCR, so no imagePullSecret is needed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rom-worker
+  namespace: CHANGME-namespace
+spec:
+  restartPolicy: Never
+  containers:
+    - name: tools
+      image: ghcr.io/borger/rom-tools:latest
+      imagePullPolicy: Always
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - { name: roms, mountPath: /roms }
+        - { name: downloads, mountPath: /downloads }
+        # For Switch/3DS work, mount your own dumped keys read-only:
+        # - { name: keys, mountPath: /keys, readOnly: true }
+  volumes:
+    # Point these at wherever your ROM library / source downloads live.
+    # NFS shown here; hostPath / PVC work just as well.
+    - name: roms
+      nfs: { server: NFS_SERVER_IP, path: /path/to/romm/library/roms }
+    - name: downloads
+      nfs: { server: NFS_SERVER_IP, path: /path/to/downloads }

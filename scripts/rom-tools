@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# rom-tools — list the bundled toolchain and confirm each binary is on PATH.
+set -u
+echo "rom-tools — homelab ROM conversion/management toolchain"
+echo
+printf '%-14s %s\n' TOOL PATH
+printf '%-14s %s\n' ---- ----
+for t in \
+    chdman PS3Dec PkgTool.Core maxcso \
+    hactool nsz ndstool ctrtool makerom \
+    extract-xiso wit wwt \
+    7z unzip unar xorriso genisoimage \
+    python3 jq sqlite3 rsync xxd; do
+  if p="$(command -v "$t" 2>/dev/null)"; then
+    printf '  ok  %-10s %s\n' "$t" "$p"
+  else
+    printf '  --  %-10s %s\n' "$t" "(missing)"
+  fi
+done
+echo
+echo "Key-gated tools (mount your own keys at runtime):"
+echo "  hactool/nsz  -> prod.keys   (Switch)"
+echo "  ctrtool      -> boot9/aes_keys (3DS)"

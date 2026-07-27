@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Generate a LibOrbisPkg GP4 project from an extracted PS4 game directory.
+
+The directory should be an unpacked PS4 app image (eboot.bin + sce_sys/ + game
+data). Every regular file becomes a <file> entry (macOS .DS_Store / AppleDouble
+junk is dropped); the directory tree becomes <rootdir>. Feed the resulting .gp4
+to `PkgTool.Core pkg_build`.
+
+NOTE — the resulting PKG is a *fake* PKG: it is self-signed with a fake
+passcode (default 32 zeros), so its hash/signature will NOT match any retail or
+Redump reference and cannot be authenticity-verified by hash. Emulators such as
+shadPS4 accept it precisely because they skip fake-PKG crypto. `pkg_validate`
+only confirms the package is internally consistent (its own digests match the
+data it contains) — not that the contents are an unmodified original dump. If
+you also rewrite the SFO (e.g. --param-sfo to change CATEGORY), the game's
+internal sce_sys digests no longer match either; harmless for shadPS4, but do
+not expect this output to hash-verify against anything.
+"""
+import argparse
+import os
+from xml.sax.saxutils import quoteattr
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", required=True, help="extracted game dir (has eboot.bin, sce_sys/)")
+    ap.add_argument("--content-id", required=True)
+    ap.add_argument("--out", required=True, help="output .gp4 path")
+    ap.add_argument("--param-sfo", default=None,
+                    help="override source path for sce_sys/param.sfo (e.g. a category-patched copy)")
+    ap.add_argument("--passcode", default="0" * 32)
+    ap.add_argument("--storage-type", default="digital50")
+    a = ap.parse_args()
+
+    root = os.path.abspath(a.root)
+    files: list[tuple[str, str]] = []
+    tree: dict = {}
+    for dp, _dns, fns in os.walk(root):
+        rel = os.path.relpath(dp, root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        node = tree
+        for p in parts:
+            node = node.setdefault(p, {})
+        for fn in fns:
+            if fn == ".DS_Store" or fn.startswith("._"):
+                continue
+            targ = fn if rel == "." else rel.replace(os.sep, "/") + "/" + fn
+            orig = a.param_sfo if (a.param_sfo and targ == "sce_sys/param.sfo") else os.path.join(dp, fn)
+            files.append((targ, orig))
+
+    def emit(node: dict, ind: str) -> str:
+        out = []
+        for name in sorted(node):
+            ch = node[name]
+            if ch:
+                out.append(f"{ind}<dir targ_name={quoteattr(name)}>")
+                out.append(emit(ch, ind + "  "))
+                out.append(f"{ind}</dir>")
+            else:
+                out.append(f"{ind}<dir targ_name={quoteattr(name)} />")
+        return "\n".join(out)
+
+    file_lines = "\n".join(
+        f"    <file targ_path={quoteattr(t)} orig_path={quoteattr(o)} />" for t, o in sorted(files)
+    )
+    rootdir_lines = emit(tree, "    ")
+
+    gp4 = f'''<?xml version="1.0" encoding="utf-8"?>
+<psproject fmt="gp4" version="1000">
+  <volume>
+    <volume_type>pkg_ps4_app</volume_type>
+    <volume_id>PS4VOLUME</volume_id>
+    <volume_ts>2020-01-01 00:00:00</volume_ts>
+    <package content_id={quoteattr(a.content_id)} passcode={quoteattr(a.passcode)} storage_type={quoteattr(a.storage_type)} app_type="full" />
+    <chunk_info chunk_count="1" scenario_count="1">
+      <chunks>
+        <chunk id="0" layer_no="0" label="Chunk #0" />
+      </chunks>
+      <scenarios default_id="0">
+        <scenario id="0" type="sp" initial_chunk_count="1" label="Scenario #0">0</scenario>
+      </scenarios>
+    </chunk_info>
+  </volume>
+  <files img_no="0">
+{file_lines}
+  </files>
+  <rootdir>
+{rootdir_lines}
+  </rootdir>
+</psproject>
+'''
+    with open(a.out, "w") as f:
+        f.write(gp4)
+    print(f"wrote {a.out}: {len(files)} files")
+
+
+if __name__ == "__main__":
+    main()

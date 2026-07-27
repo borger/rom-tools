@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Build a fake-PKG (fpkg) from an extracted PS4 game directory — turns a
+# many-thousand-file unpacked game into a single installable .pkg.
+#
+#   ps4-fpkg <extracted_game_dir> <out_dir> [--category gd]
+#
+# --category gd rewrites the SFO CATEGORY (e.g. a patch-labeled `gp` merged
+# dump) so emulators treat the result as a standalone base game. The content_id
+# is read from the game's own param.sfo. Validates the result before exiting.
+set -euo pipefail
+export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+
+SRC="${1:?usage: ps4-fpkg <extracted_game_dir> <out_dir> [--category gd]}"
+OUT="${2:?usage: ps4-fpkg <extracted_game_dir> <out_dir> [--category gd]}"
+shift 2
+CATEGORY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --category) CATEGORY="${2:?}"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$SRC/sce_sys/param.sfo" ] || { echo "no sce_sys/param.sfo under $SRC" >&2; exit 1; }
+CID="$(PkgTool.Core sfo_listentries "$SRC/sce_sys/param.sfo" | awk -F'= ' '/CONTENT_ID/{print $2; exit}')"
+[ -n "$CID" ] || { echo "could not read CONTENT_ID from param.sfo" >&2; exit 1; }
+echo "content_id: $CID"
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+PARAM_ARG=()
+if [ -n "$CATEGORY" ]; then
+  cp "$SRC/sce_sys/param.sfo" "$TMP/param.sfo"
+  PkgTool.Core sfo_setentry --value "$CATEGORY" "$TMP/param.sfo" CATEGORY
+  PARAM_ARG=(--param-sfo "$TMP/param.sfo")
+  echo "category -> $CATEGORY"
+fi
+
+mkdir -p "$OUT"
+gen-gp4 --root "$SRC" --content-id "$CID" --out "$TMP/project.gp4" "${PARAM_ARG[@]}"
+echo "building pkg (this reads the whole game and writes a same-size .pkg)..."
+PkgTool.Core pkg_build "$TMP/project.gp4" "$OUT"
+
+PKG="$(ls -1t "$OUT"/*.pkg | head -1)"
+echo "built: $PKG"
+echo "--- pkg_validate ---"
+PkgTool.Core pkg_validate "$PKG"
+echo
+echo "NOTE: this is a fake PKG (self-signed, fake passcode) — its hash will NOT"
+echo "      match a retail/Redump reference and cannot be authenticity-verified"
+echo "      by hash. pkg_validate confirms internal consistency only. Emulators"
+echo "      like shadPS4 accept it because they skip fake-PKG crypto."
