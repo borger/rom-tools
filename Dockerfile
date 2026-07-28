@@ -84,6 +84,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       rsync curl wget ca-certificates xxd file coreutils git jq sqlite3 \
       liblz4-1 zlib1g libicu74 libssl3 libuv1 \
  && rm -rf /var/lib/apt/lists/*
+# PkgTool.Core is a 2020 .NET Core 3.x binary linked against libssl1.1, which
+# Ubuntu 24.04 no longer ships (it has libssl3). Fetch the focal .deb so the
+# binary can actually run — being on PATH is not enough (see execution smoke
+# test below, which is what caught this).
+RUN curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb \
+ && dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb \
+ && rm -f libssl1.1_1.1.1f-1ubuntu2_amd64.deb
 # Switch NSZ/XCZ (de)compression (Python, PEP668 override on 24.04)
 RUN pip3 install --no-cache-dir --break-system-packages nsz
 COPY --from=builder /out/bin/ /usr/local/bin/
@@ -91,11 +98,16 @@ COPY --from=builder /out/bin/ /usr/local/bin/
 # ps4-fpkg, chd-convert, gen-gp4).
 COPY scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/*
-# Smoke test — fail the build if any expected tool/script is missing from PATH.
+# Smoke test — presence on PATH AND actual execution for the runtime-linked
+# binary. Presence alone is NOT enough: PkgTool.Core was on PATH yet aborted at
+# runtime for a missing libssl1.1. `version` is a safe no-op that exercises the
+# .NET runtime + its native deps.
 RUN set -e; for t in chdman PS3Dec PkgTool.Core maxcso hactool nsz ndstool \
         extract-xiso ctrtool makerom wit wwt 7z xorriso \
         rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4; do \
       command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }; \
-    done; echo "rom-tools: all tools present"
+    done; \
+    PkgTool.Core version >/dev/null || { echo "PkgTool.Core present but will not execute"; exit 1; }; \
+    echo "rom-tools: tools present; PkgTool executes"
 WORKDIR /work
 CMD ["/bin/bash"]
