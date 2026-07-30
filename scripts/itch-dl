@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""itch-dl — download a game from itch.io via the official API and drop the ROM
+into a RomM platform folder.
+
+Usage:
+  ITCH_API_KEY=... itch-dl <game-url|game-id> <romm-platform> [rom-exts-csv]
+
+Examples:
+  ITCH_API_KEY=... itch-dl https://mxretrodev.itch.io/final-fight-md genesis bin,md,gen
+  ITCH_API_KEY=... itch-dl 2480321 genesis bin
+
+The API key authenticates your itch account; free / name-your-price games are
+downloadable. If a rom-exts list is given and the upload is a zip, only files
+with those extensions are copied to /roms/<platform>/ (otherwise the whole
+extracted payload is copied). Non-zip uploads are placed as-is.
+"""
+import os, sys, re, json, tempfile, shutil, subprocess, urllib.request, urllib.error
+
+KEY = os.environ.get("ITCH_API_KEY")
+if not KEY:
+    sys.exit("ITCH_API_KEY not set")
+if len(sys.argv) < 3:
+    sys.exit("usage: itch-dl <game-url|game-id> <romm-platform> [rom-exts-csv]")
+
+game_arg, platform = sys.argv[1], sys.argv[2]
+exts = tuple("." + e.strip().lstrip(".").lower()
+             for e in sys.argv[3].split(",")) if len(sys.argv) > 3 else ()
+API = "https://api.itch.io"
+ROMS = f"/roms/{platform}"
+
+def _open(url):
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "itch-dl", "Authorization": KEY}),
+        timeout=120)
+
+def api(path):
+    sep = "&" if "?" in path else "?"
+    return json.loads(_open(f"{API}{path}{sep}api_key={KEY}").read())
+
+# 1. resolve game id
+if game_arg.isdigit():
+    gid = int(game_arg)
+else:
+    dj = json.loads(urllib.request.urlopen(game_arg.rstrip("/") + "/data.json", timeout=30).read())
+    gid = dj["id"]
+print(f"game id: {gid}")
+
+# 2. list uploads
+uploads = api(f"/games/{gid}/uploads")["uploads"]
+if not uploads:
+    sys.exit("no uploads returned (game may require ownership/claim)")
+for u in uploads:
+    print(f"  upload {u['id']}  {u['filename']}  ({u.get('size','?')} bytes)")
+
+# 3. pick the upload — prefer a .zip, else first
+up = next((u for u in uploads if u["filename"].lower().endswith(".zip")), uploads[0])
+print(f"selected: {up['filename']} (id {up['id']})")
+
+# 4. resolve download url + fetch.
+# NB: send NO Authorization header here — itch 302-redirects to a signed CDN URL
+# that rejects the auth header (HTTP 400). The ?api_key= query authorizes the
+# API call; the redirect target is already signed and needs no auth.
+dl_req = urllib.request.Request(
+    f"{API}/uploads/{up['id']}/download?api_key={KEY}",
+    headers={"User-Agent": "itch-dl"})
+resp = urllib.request.urlopen(dl_req, timeout=120)
+if resp.headers.get_content_type() == "application/json":
+    resp = urllib.request.urlopen(json.loads(resp.read())["url"], timeout=120)
+tmp = tempfile.mkdtemp()
+dlfile = os.path.join(tmp, up["filename"])
+with open(dlfile, "wb") as f:
+    shutil.copyfileobj(resp, f)
+print(f"downloaded: {os.path.getsize(dlfile)} bytes")
+
+# 5. extract / select the rom(s)
+os.makedirs(ROMS, exist_ok=True)
+placed = []
+if dlfile.lower().endswith(".zip"):
+    exdir = os.path.join(tmp, "ex"); os.makedirs(exdir)
+    subprocess.run(["7z", "x", "-y", "-o" + exdir, dlfile],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    for root, _, files in os.walk(exdir):
+        for fn in files:
+            if not exts or fn.lower().endswith(exts):
+                src = os.path.join(root, fn)
+                dst = os.path.join(ROMS, fn)
+                shutil.copy2(src, dst); placed.append(dst)
+else:
+    dst = os.path.join(ROMS, up["filename"])
+    shutil.copy2(dlfile, dst); placed.append(dst)
+
+# 6. own it like the rest of the library
+for p in placed:
+    try: os.chown(p, 1000, 1000)
+    except PermissionError: pass
+shutil.rmtree(tmp, ignore_errors=True)
+
+if not placed:
+    sys.exit(f"no files matched extensions {exts} in the download")
+print(f"\nplaced {len(placed)} file(s) in {ROMS}:")
+for p in placed:
+    print(f"  {os.path.getsize(p)} bytes  {os.path.basename(p)}")

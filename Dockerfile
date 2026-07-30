@@ -104,7 +104,7 @@ RUN chmod +x /usr/local/bin/*
 # .NET runtime + its native deps.
 RUN set -e; for t in chdman PS3Dec PkgTool.Core maxcso hactool nsz ndstool \
         extract-xiso ctrtool makerom wit wwt 7z xorriso \
-        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4; do \
+        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4 itch-dl; do \
       command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }; \
     done; \
     PkgTool.Core version >/dev/null || { echo "PkgTool.Core present but will not execute"; exit 1; }; \
