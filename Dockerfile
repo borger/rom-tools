@@ -95,7 +95,7 @@ RUN curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1
 RUN pip3 install --no-cache-dir --break-system-packages nsz
 COPY --from=builder /out/bin/ /usr/local/bin/
 # Workflow scripts ship as extensionless commands on PATH (rom-tools, ps3-decrypt,
-# ps4-fpkg, chd-convert, gen-gp4).
+# ps4-fpkg, chd-convert, gen-gp4, xiso-convert, itch-dl).
 COPY scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/*
 # Smoke test — presence on PATH AND actual execution for the runtime-linked
@@ -104,7 +104,7 @@ RUN chmod +x /usr/local/bin/*
 # .NET runtime + its native deps.
 RUN set -e; for t in chdman PS3Dec PkgTool.Core maxcso hactool nsz ndstool \
         extract-xiso ctrtool makerom wit wwt 7z xorriso \
-        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4 itch-dl; do \
+        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4 xiso-convert itch-dl; do \
       command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }; \
     done; \
     PkgTool.Core version >/dev/null || { echo "PkgTool.Core present but will not execute"; exit 1; }; \
