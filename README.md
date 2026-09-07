@@ -65,6 +65,7 @@ Beyond the raw tools, a few higher-level workflows ship as commands on `PATH`
 | `ps3-decrypt <src_dir> <dkey_dir> <out_dir>` | Batch-decrypt Redump PS3 images with their disc keys; SCE-verifies each result and drops bad ones |
 | `ps4-fpkg <extracted_dir> <out_dir> [--category gd]` | Repack an extracted PS4 game into a single fake-PKG (`gen-gp4` → `pkg_build` → `pkg_validate`) |
 | `chd-convert <src_dir> <out_dir>` | Convert every `.cue`/`.gdi` to CHD and build `.m3u` for multi-disc sets |
+| `xiso-convert <extract\|create\|rewrite> <src_dir> <out_dir>` | Batch Xbox/360 XISO work — extract to trees, build ISOs from trees, or repack to strip padding; verifies `default.xbe`/`.xex` and drops bad output |
 | `gen-gp4` | Generate a LibOrbisPkg GP4 project from an extracted PS4 directory (used by `ps4-fpkg`) |
 
 > A PKG produced by `ps4-fpkg`/`gen-gp4` is a **fake PKG** — self-signed with a

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Batch extract, rebuild, or re-pack Xbox / Xbox 360 XISO disc images.
+#
+#   xiso-convert extract <src_dir> <out_dir>   # .iso -> out_dir/<title>/
+#   xiso-convert create  <src_dir> <out_dir>   # out_dir/<title>.iso <- src_dir/<title>/
+#   xiso-convert rewrite <src_dir> <out_dir>   # .iso -> out_dir/<title>.iso, repacked
+#
+# rewrite re-lays the filesystem and drops the padding that redump-style dumps
+# carry, so it is the mode that shrinks a library; sources are never modified
+# (output always goes to out_dir). Every result is verified via the title's
+# executable -- XBEH/XEX2 magic for an extracted tree, a listing entry for a
+# built ISO -- and a failed job has its partial output deleted rather than
+# left behind.
+#
+# Xbox and Xbox 360: extract-xiso probes all four XDVDFS offsets (0 for Xbox,
+# XGD1/2/3 for 360), so `extract` handles both. `create` and `rewrite` always
+# emit an offset-0 image, which is the right shape for Xbox but NOT for a 360
+# title -- repack 360 content with a 360-aware tool instead.
+set -uo pipefail
+
+MODE="${1:?usage: xiso-convert <extract|create|rewrite> <src_dir> <out_dir>}"
+SRC="${2:?usage: xiso-convert <extract|create|rewrite> <src_dir> <out_dir>}"
+OUT="${3:?usage: xiso-convert <extract|create|rewrite> <src_dir> <out_dir>}"
+[ -d "$SRC" ] || { echo "no such src_dir: $SRC" >&2; exit 1; }
+mkdir -p "$OUT"
+shopt -s nullglob nocaseglob
+
+# An extracted tree is good if its root executable carries the right magic:
+# default.xbe -> XBEH (58424548) on Xbox, default.xex -> XEX2 (58455832) on 360.
+verify_tree() {
+  local dir="$1" exe="" magic
+  for cand in "$dir"/default.xbe "$dir"/default.xex; do
+    [ -f "$cand" ] && { exe="$cand"; break; }
+  done
+  [ -n "$exe" ] || { echo "  FAIL: no default.xbe/.xex in output"; return 1; }
+  magic="$(head -c4 "$exe" 2>/dev/null | xxd -p)"
+  case "$magic" in
+    58424548|58455832) return 0 ;;
+    *) echo "  FAIL: $(basename "$exe") magic '$magic' is neither XBEH nor XEX2"; return 1 ;;
+  esac
+}
+
+# A built ISO is good if extract-xiso can list it and sees a root executable.
+verify_iso() {
+  local iso="$1"
+  [ -s "$iso" ] || { echo "  FAIL: output missing or empty"; return 1; }
+  if ! extract-xiso -l "$iso" 2>/dev/null | grep -qiE 'default\.(xbe|xex)'; then
+    echo "  FAIL: built ISO does not list a default.xbe/.xex"; return 1
+  fi
+  return 0
+}
+
+ok=0; fail=0
+
+case "$MODE" in
+  extract)
+    for iso in "$SRC"/*.iso; do
+      base="$(basename "$iso")"; base="${base%.*}"
+      dest="$OUT/$base"
+      echo "### $base"
+      rm -rf "$dest"; mkdir -p "$dest"
+      if extract-xiso -q -s "$iso" -d "$dest" >/dev/null 2>&1 && verify_tree "$dest"; then
+        echo "  OK -> $base/ ($(find "$dest" -type f | wc -l | tr -d ' ') files)"
+        ok=$((ok+1))
+      else
+        rm -rf "$dest"; fail=$((fail+1))
+      fi
+    done
+    ;;
+
+  create)
+    for dir in "$SRC"/*/; do
+      base="$(basename "${dir%/}")"
+      iso="$OUT/$base.iso"
+      echo "### $base"
+      if [ ! -f "$dir/default.xbe" ] && [ ! -f "$dir/default.xex" ]; then
+        echo "  FAIL: no default.xbe/.xex in source dir — not an Xbox game tree"
+        fail=$((fail+1)); continue
+      fi
+      if [ -f "$dir/default.xex" ]; then
+        echo "  NOTE: 360 title — the built ISO is offset-0, not XGD"
+      fi
+      rm -f "$iso"
+      if extract-xiso -q -c "${dir%/}" "$iso" >/dev/null 2>&1 && verify_iso "$iso"; then
+        echo "  OK -> $base.iso"; ok=$((ok+1))
+      else
+        rm -f "$iso"; fail=$((fail+1))
+      fi
+    done
+    ;;
+
+  rewrite)
+    # -r rewrites in place, so work on a copy in out_dir and repack that.
+    for iso in "$SRC"/*.iso; do
+      base="$(basename "$iso")"; base="${base%.*}"
+      dest="$OUT/$base.iso"
+      echo "### $base"
+      before="$(stat -c%s "$iso" 2>/dev/null || stat -f%z "$iso")"
+      cp "$iso" "$dest" || { echo "  FAIL: copy"; rm -f "$dest"; fail=$((fail+1)); continue; }
+      if extract-xiso -q -s -r "$dest" -d "$OUT" >/dev/null 2>&1 && verify_iso "$dest"; then
+        after="$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest")"
+        echo "  OK -> $base.iso ($((before/1024/1024)) MiB -> $((after/1024/1024)) MiB)"
+        ok=$((ok+1))
+      else
+        rm -f "$dest"; fail=$((fail+1))
+      fi
+      # -r leaves the pre-rewrite image beside the result as <name>.old.iso.
+      rm -f "$OUT/$base.old.iso"
+    done
+    ;;
+
+  *)
+    echo "unknown mode: $MODE (expected extract, create, or rewrite)" >&2
+    exit 2 ;;
+esac
+
+echo "done: ok=$ok fail=$fail"
