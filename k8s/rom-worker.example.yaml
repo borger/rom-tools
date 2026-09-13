@@ -21,7 +21,8 @@ spec:
       volumeMounts:
         - { name: roms, mountPath: /roms }
         - { name: downloads, mountPath: /downloads }
-        # For Switch/3DS work, mount your own dumped keys read-only:
+        # For Switch/3DS/Wii work, mount your own dumped keys read-only
+        # (wii-cdn2wad reads /keys/wii):
         # - { name: keys, mountPath: /keys, readOnly: true }
   volumes:
     # Point these at wherever your ROM library / source downloads live.

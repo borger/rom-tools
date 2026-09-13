@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Pack raw Wii NUS/CDN title dumps into installable WADs (Dolphin, real Wii).
+
+    wii-cdn2wad <src_dir> <out_dir> [--title-keys FILE] [--tickets DIR]
+                [--common-key FILE] [--korean-key FILE] [--cert-chain FILE]
+
+src_dir is one title dump (a TMD plus its content files named by 8-hex content
+ID, as the CDN serves them) or a folder of such dumps; each becomes
+out_dir/<dump dir name>.wad.
+
+A WAD needs a ticket, which CDN dumps of paid titles lack. For each title the
+first source that decrypts correctly wins:
+
+  1. a ticket inside the dump   (cetk or *.tik)
+  2. --tickets DIR              <tid>.tik or <tid_hi>/<tid_lo>.tik, the layout
+                                of a console NAND's /ticket folder
+  3. --title-keys FILE          one "<16-hex title ID> <32-hex title key>" per
+                                line; the key may be plain or common-key
+                                encrypted, both are tried
+
+Sources 1-2 are genuine signed tickets, so the WAD is properly signed. Source
+3 builds a new ticket, which cannot carry Nintendo's signature: that WAD is
+FAKESIGNED (zeroed signature, trucha-style hash). Dolphin installs it because
+its WAD import skips signature checks; a real Wii needs a patched IOS. Either
+way a WAD from this tool will not byte-match one from another packer.
+
+Keys are never in the image. Mount your own at runtime -- by default the
+script reads /keys/wii/common.key (and korean.key for Korean titles), each 16
+raw bytes or 32 hex characters. The common key is required: without it no
+ticket can be decrypted, so nothing can be verified.
+
+The WAD cert chain (Nintendo's public CA/CP/XS certificates) comes from the
+dump's TMD and cetk; when the dump has no cetk the XS certificate is fetched
+from the public NUS System Menu ticket, or pass --cert-chain for offline use.
+
+Every WAD is re-read after writing and each content is decrypted and SHA-1
+checked against the TMD. A title that fails is deleted, not left behind.
+"""
+import argparse
+import hashlib
+import os
+import re
+import struct
+import sys
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+TICKET_SIZE = 0x2A4
+CA_CERT_SIZE = 0x400
+CP_XS_CERT_SIZE = 0x300
+NUS_SYSMENU_CETK = "http://nus.cdn.shop.wii.com/ccs/download/0000000100000002/cetk"
+SIG_TYPES = {0x00010000: 0x200, 0x00010001: 0x100}  # RSA-4096, RSA-2048 -> sig length
+HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def align(n: int, to: int) -> int:
+    return (n + to - 1) & ~(to - 1)
+
+
+def pad(data: bytes, to: int = 0x40) -> bytes:
+    return data + b"\0" * (align(len(data), to) - len(data))
+
+
+def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+    return d.update(data) + d.finalize()
+
+
+def aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    e = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    return e.update(data) + e.finalize()
+
+
+def load_key(path: Path) -> bytes | None:
+    """A 16-byte AES key stored raw or as 32 hex characters; None if absent."""
+    if not path.is_file():
+        return None
+    raw = path.read_bytes()
+    if len(raw) == 16:
+        return raw
+    text = raw.decode("ascii", "ignore").strip()
+    if HEX32.match(text):
+        return bytes.fromhex(text)
+    sys.exit(f"{path}: not a 16-byte key (expected 16 raw bytes or 32 hex chars)")
+
+
+# --- TMD / ticket / certs ---------------------------------------------------
+
+@dataclass
+class Content:
+    cid: int
+    index: int
+    ctype: int
+    size: int
+    sha1: bytes
+
+
+@dataclass
+class TMD:
+    raw: bytes      # the TMD alone, appended certs stripped
+    extra: bytes    # whatever the CDN appended after it (CP + CA certs)
+    title_id: int
+    version: int
+    contents: list[Content]
+
+
+def parse_tmd(data: bytes) -> TMD:
+    sig_type = struct.unpack_from(">I", data, 0)[0]
+    if sig_type not in SIG_TYPES:
+        raise ValueError(f"not a TMD (signature type {sig_type:#x})")
+    b = 4 + SIG_TYPES[sig_type] + 0x3C          # body start (0x140 for RSA-2048)
+    title_id = struct.unpack_from(">Q", data, b + 0x4C)[0]
+    version, n = struct.unpack_from(">HH", data, b + 0x9C)
+    end = b + 0xA4 + 36 * n
+    if len(data) < end:
+        raise ValueError("TMD truncated")
+    contents = []
+    for i in range(n):
+        cid, index, ctype, size = struct.unpack_from(">IHHQ", data, b + 0xA4 + 36 * i)
+        sha1 = data[b + 0xA4 + 36 * i + 16: b + 0xA4 + 36 * i + 36]
+        contents.append(Content(cid, index, ctype, size, sha1))
+    return TMD(data[:end], data[end:], title_id, version, contents)
+
+
+def cert_name(cert: bytes) -> str:
+    sig_type = struct.unpack_from(">I", cert, 0)[0]
+    b = 4 + SIG_TYPES.get(sig_type, 0x100) + 0x3C
+    return cert[b + 0x44: b + 0x84].rstrip(b"\0").decode("ascii", "replace")
+
+
+def split_certs(blob: bytes) -> dict[str, bytes]:
+    """Index a run of concatenated certificates by name prefix (CA/CP/XS)."""
+    certs, off = {}, 0
+    while off + 4 <= len(blob):
+        sig_type = struct.unpack_from(">I", blob, off)[0]
+        if sig_type not in SIG_TYPES:
+            break
+        size = CA_CERT_SIZE if sig_type == 0x00010000 else CP_XS_CERT_SIZE
+        cert = blob[off: off + size]
+        if len(cert) < size:
+            break
+        certs.setdefault(cert_name(cert)[:2], cert)
+        off += size
+    return certs
+
+
+def title_key_from_ticket(ticket: bytes, common: dict[int, bytes]) -> bytes | None:
+    idx = ticket[0x1F1]
+    key = common.get(idx)
+    if key is None:
+        return None
+    return aes_cbc_decrypt(key, ticket[0x1DC:0x1E4] + b"\0" * 8, ticket[0x1BF:0x1CF])
+
+
+def build_fakesigned_ticket(title_id: int, version: int, title_key: bytes,
+                            common_key: bytes) -> bytes:
+    t = bytearray(TICKET_SIZE)
+    struct.pack_into(">I", t, 0, 0x00010001)                   # RSA-2048; signature left zeroed
+    t[0x140:0x140 + 26] = b"Root-CA00000001-XS00000003"
+    tid = struct.pack(">Q", title_id)
+    t[0x1BF:0x1CF] = aes_cbc_encrypt(common_key, tid + b"\0" * 8, title_key)
+    t[0x1DC:0x1E4] = tid
+    struct.pack_into(">HH", t, 0x1E4, 0xFFFF, version)
+    t[0x1F1] = 0                                               # retail common key
+    t[0x222:0x262] = b"\xff" * 0x40                            # all contents accessible
+    # Trucha: brute-force an unused field until the body hash starts with 0x00.
+    for n in range(1, 0x10000):
+        struct.pack_into(">H", t, 0x1F2, n)
+        if hashlib.sha1(t[0x140:]).digest()[0] == 0:
+            return bytes(t)
+    raise RuntimeError("fakesign brute force exhausted")
+
+
+# --- dump discovery ----------------------------------------------------------
+
+def find_tmd(d: Path) -> Path | None:
+    cands = [p for p in d.iterdir() if p.is_file() and
+             (p.name.lower() in ("tmd", "title.tmd") or re.fullmatch(r"(?i)tmd\.\d+", p.name)
+              or p.suffix.lower() == ".tmd")]
+    if not cands:
+        return None
+    # Several versions side by side: take the highest numbered one.
+    def ver(p: Path) -> int:
+        m = re.search(r"\.(\d+)$", p.name)
+        return int(m.group(1)) if m else -1
+    return max(cands, key=ver)
+
+
+def find_content(d: Path, cid: int) -> Path | None:
+    for name in (f"{cid:08x}", f"{cid:08X}", f"{cid:08x}.app", f"{cid:08X}.app"):
+        if (d / name).is_file():
+            return d / name
+    return None
+
+
+def find_dump_ticket(d: Path) -> bytes | None:
+    for p in sorted(d.iterdir()):
+        if p.is_file() and (p.name.lower() == "cetk" or p.suffix.lower() == ".tik"):
+            return p.read_bytes()
+    return None
+
+
+def find_nand_ticket(tickets: Path | None, title_id: int) -> bytes | None:
+    if tickets is None:
+        return None
+    hi, lo = title_id >> 32, title_id & 0xFFFFFFFF
+    for rel in (f"{title_id:016x}.tik", f"{title_id:016X}.tik", f"{hi:08x}/{lo:08x}.tik"):
+        if (tickets / rel).is_file():
+            return (tickets / rel).read_bytes()
+    return None
+
+
+def load_title_keys(path: Path | None) -> dict[int, bytes]:
+    keys: dict[int, bytes] = {}
+    if path is None:
+        return keys
+    for line in path.read_text(errors="ignore").splitlines():
+        parts = re.split(r"[\s,;:=|]+", line.split("#", 1)[0].strip())
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-fA-F]{16}", parts[0]) and HEX32.match(parts[1]):
+            keys[int(parts[0], 16)] = bytes.fromhex(parts[1])
+    return keys
+
+
+# --- decrypt / verify ------------------------------------------------------------
+
+def content_ok(enc: bytes, key: bytes, c: Content) -> bool:
+    enc = enc[: align(c.size, 16)]
+    if len(enc) < align(c.size, 16):
+        return False
+    iv = struct.pack(">H", c.index) + b"\0" * 14
+    return hashlib.sha1(aes_cbc_decrypt(key, iv, enc)[: c.size]).digest() == c.sha1
+
+
+def verify_wad(path: Path, common: dict[int, bytes]) -> str | None:
+    """Re-read a written WAD the way Dolphin does; None when every content checks."""
+    data = path.read_bytes()
+    hdr, wtype, _, cert_sz, _, tik_sz, tmd_sz, _, _ = struct.unpack_from(">I2sHIIIIII", data, 0)
+    if hdr != 0x20 or wtype != b"Is":
+        return "bad WAD header"
+    off = align(0x20, 0x40)
+    names = [cert_name(c)[:2] for c in split_certs(data[off: off + cert_sz]).values()]
+    if names != ["CA", "CP", "XS"]:
+        return f"cert chain is {names}, expected CA, CP, XS"
+    off = align(off + cert_sz, 0x40)
+    ticket = data[off: off + tik_sz]
+    off = align(off + tik_sz, 0x40)
+    tmd = parse_tmd(data[off: off + tmd_sz])
+    off = align(off + tmd_sz, 0x40)
+    key = title_key_from_ticket(ticket, common)
+    if key is None:
+        return f"no common key mounted for index {ticket[0x1F1]}"
+    for c in tmd.contents:
+        if not content_ok(data[off: off + align(c.size, 16)], key, c):
+            return f"content {c.cid:08x} fails SHA-1 in written WAD"
+        off += align(c.size, 0x40)
+    return None
+
+
+# --- per-title ------------------------------------------------------------------
+
+def get_xs_cert(cert_chain_file: Path | None, cache: dict) -> bytes:
+    if "XS" in cache:
+        return cache["XS"]
+    if cert_chain_file is not None:
+        blob = cert_chain_file.read_bytes()
+    else:
+        with urllib.request.urlopen(NUS_SYSMENU_CETK, timeout=30) as r:
+            blob = r.read()[TICKET_SIZE:]
+    xs = split_certs(blob).get("XS")
+    if xs is None:
+        raise RuntimeError("no XS certificate found in cert source")
+    cache["XS"] = xs
+    return xs
+
+
+def convert(dump: Path, out_dir: Path, args, common: dict[int, bytes],
+            title_keys: dict[int, bytes], cert_cache: dict) -> bool:
+    tmd_path = find_tmd(dump)
+    tmd = parse_tmd(tmd_path.read_bytes())
+    tid = tmd.title_id
+    print(f"  title {tid:016x} v{tmd.version}, {len(tmd.contents)} contents ({tmd_path.name})")
+
+    files = {}
+    for c in tmd.contents:
+        p = find_content(dump, c.cid)
+        if p is None:
+            print(f"  FAIL: content {c.cid:08x} missing from dump")
+            return False
+        if p.stat().st_size < align(c.size, 16):
+            print(f"  FAIL: content {c.cid:08x} truncated ({p.stat().st_size} < {align(c.size, 16)})")
+            return False
+        files[c.cid] = p
+
+    # Probe candidate keys against the smallest content: cheap, and decisive.
+    probe = min(tmd.contents, key=lambda c: c.size)
+    probe_enc = files[probe.cid].read_bytes()
+
+    ticket, dump_ticket_blob = None, find_dump_ticket(dump)
+    for label, blob in (("dump ticket", dump_ticket_blob),
+                        ("--tickets", find_nand_ticket(args.tickets, tid))):
+        if blob is None or len(blob) < TICKET_SIZE:
+            continue
+        t = blob[:TICKET_SIZE]
+        if struct.unpack_from(">Q", t, 0x1DC)[0] != tid:
+            print(f"  skip {label}: ticket is for another title")
+            continue
+        key = title_key_from_ticket(t, common)
+        if key is None:
+            print(f"  skip {label}: needs common key index {t[0x1F1]}, not mounted")
+        elif content_ok(probe_enc, key, probe):
+            ticket = t
+            print(f"  ticket: {label} (genuine, signed)")
+            break
+        else:
+            print(f"  skip {label}: title key does not decrypt contents")
+
+    if ticket is None and tid in title_keys:
+        raw = title_keys[tid]
+        tid_iv = struct.pack(">Q", tid) + b"\0" * 8
+        candidates = [("plain", raw)] + [
+            (f"encrypted, common key {i}", aes_cbc_decrypt(k, tid_iv, raw))
+            for i, k in sorted(common.items())]
+        for how, key in candidates:
+            if content_ok(probe_enc, key, probe):
+                ticket = build_fakesigned_ticket(tid, tmd.version, key, common[0])
+                print(f"  ticket: built from --title-keys ({how}) — FAKESIGNED")
+                break
+        else:
+            print("  skip --title-keys: key does not decrypt contents")
+
+    if ticket is None:
+        print("  FAIL: no ticket or title key that decrypts this title")
+        return False
+
+    # Cert chain order in a WAD is CA, CP, XS.
+    certs = split_certs(tmd.extra)
+    if dump_ticket_blob is not None:
+        for k, v in split_certs(dump_ticket_blob[TICKET_SIZE:]).items():
+            certs.setdefault(k, v)
+    if args.cert_chain is not None:
+        for k, v in split_certs(args.cert_chain.read_bytes()).items():
+            certs.setdefault(k, v)
+    if "XS" not in certs:
+        certs["XS"] = get_xs_cert(args.cert_chain, cert_cache)
+    missing = [k for k in ("CA", "CP", "XS") if k not in certs]
+    if missing:
+        print(f"  FAIL: cert chain incomplete (missing {', '.join(missing)}); pass --cert-chain")
+        return False
+    cert_chain = certs["CA"] + certs["CP"] + certs["XS"]
+
+    wad = out_dir / f"{dump.name}.wad"
+    data_size = sum(align(c.size, 0x40) for c in tmd.contents[:-1]) + align(tmd.contents[-1].size, 16)
+    try:
+        with wad.open("wb") as f:
+            f.write(pad(struct.pack(">I2sHIIIIII", 0x20, b"Is", 0, len(cert_chain), 0,
+                                    TICKET_SIZE, len(tmd.raw), data_size, 0)))
+            f.write(pad(cert_chain))
+            f.write(pad(ticket))
+            f.write(pad(tmd.raw))
+            for c in tmd.contents:
+                with files[c.cid].open("rb") as src:
+                    f.write(pad(src.read(align(c.size, 16))))
+        err = verify_wad(wad, common)
+    except Exception as e:  # anything mid-write still must not leave a partial WAD
+        err = str(e) or type(e).__name__
+    if err:
+        print(f"  FAIL: {err} — removing")
+        wad.unlink(missing_ok=True)
+        return False
+    print(f"  OK (all contents SHA-1 verified) -> {wad.name} ({wad.stat().st_size // 1024} KiB)")
+    return True
+
+
+def main() -> None:
+    keys = Path(os.environ.get("WII_KEYS_DIR", "/keys/wii"))
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src_dir", type=Path, help="one CDN title dump, or a folder of them")
+    ap.add_argument("out_dir", type=Path)
+    ap.add_argument("--title-keys", type=Path, default=None,
+                    help=f"title key list (default: {keys}/titlekeys.txt if present)")
+    ap.add_argument("--tickets", type=Path, default=None,
+                    help="folder of .tik files, flat by title ID or NAND /ticket layout")
+    ap.add_argument("--common-key", type=Path, default=keys / "common.key")
+    ap.add_argument("--korean-key", type=Path, default=keys / "korean.key")
+    ap.add_argument("--cert-chain", type=Path, default=None,
+                    help="file holding the XS certificate (e.g. a cetk or cert.sys) for offline use")
+    args = ap.parse_args()
+
+    common = {0: load_key(args.common_key)}
+    if common[0] is None:
+        sys.exit(f"common key not found at {args.common_key} — mount your own keys "
+                 f"(see --help); they are never shipped in the image")
+    if (korean := load_key(args.korean_key)) is not None:
+        common[1] = korean
+    if args.title_keys is None and (keys / "titlekeys.txt").is_file():
+        args.title_keys = keys / "titlekeys.txt"
+    title_keys = load_title_keys(args.title_keys)
+
+    src = args.src_dir
+    if not src.is_dir():
+        sys.exit(f"no such src_dir: {src}")
+    dumps = [src] if find_tmd(src) else sorted(d for d in src.iterdir() if d.is_dir() and find_tmd(d))
+    if not dumps:
+        sys.exit(f"no TMD found in {src} or its subfolders")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    ok = fail = 0
+    cert_cache: dict = {}
+    for dump in dumps:
+        print(f"### {dump.name}")
+        try:
+            good = convert(dump, args.out_dir, args, common, title_keys, cert_cache)
+        except Exception as e:  # one bad dump must not stop the batch
+            print(f"  FAIL: {e}")
+            good = False
+        ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
+    print(f"done: ok={ok} fail={fail}")
+
+
+if __name__ == "__main__":
+    main()
