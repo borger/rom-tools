@@ -9,6 +9,7 @@
 # Some tools require YOUR OWN dumped keys at runtime (not shipped in the image):
 #   - Switch  (hactool, nsz): prod.keys
 #   - 3DS     (ctrtool)      : boot9 / aes_keys
+#   - Wii     (wii-cdn2wad)  : common.key (+ korean.key), title keys or tickets
 # Mount them into the container when you need those platforms.
 
 ########################  builder  ########################
@@ -80,7 +81,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       mame-tools \
       p7zip-full unzip zip unar xorriso genisoimage \
-      python3 python3-pip \
+      python3 python3-pip python3-cryptography \
       rsync curl wget ca-certificates xxd file coreutils git jq sqlite3 \
       liblz4-1 zlib1g libicu74 libssl3 libuv1 \
  && rm -rf /var/lib/apt/lists/*
@@ -95,7 +96,7 @@ RUN curl -fsSLO http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1
 RUN pip3 install --no-cache-dir --break-system-packages nsz
 COPY --from=builder /out/bin/ /usr/local/bin/
 # Workflow scripts ship as extensionless commands on PATH (rom-tools, ps3-decrypt,
-# ps4-fpkg, chd-convert, gen-gp4, xiso-convert, itch-dl).
+# ps4-fpkg, chd-convert, gen-gp4, xiso-convert, wii-cdn2wad, itch-dl).
 COPY scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/*
 # Smoke test — presence on PATH AND actual execution for the runtime-linked
@@ -104,10 +105,11 @@ RUN chmod +x /usr/local/bin/*
 # .NET runtime + its native deps.
 RUN set -e; for t in chdman PS3Dec PkgTool.Core maxcso hactool nsz ndstool \
         extract-xiso ctrtool makerom wit wwt 7z xorriso \
-        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4 xiso-convert itch-dl; do \
+        rom-tools ps3-decrypt ps4-fpkg chd-convert gen-gp4 xiso-convert wii-cdn2wad itch-dl; do \
       command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }; \
     done; \
     PkgTool.Core version >/dev/null || { echo "PkgTool.Core present but will not execute"; exit 1; }; \
-    echo "rom-tools: tools present; PkgTool executes"
+    wii-cdn2wad --help >/dev/null || { echo "wii-cdn2wad present but will not execute"; exit 1; }; \
+    echo "rom-tools: tools present; PkgTool.Core and wii-cdn2wad execute"
 WORKDIR /work
 CMD ["/bin/bash"]
